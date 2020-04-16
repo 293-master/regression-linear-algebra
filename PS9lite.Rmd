@@ -26,20 +26,10 @@ knitr::opts_chunk$set(
 
 # Load all your used packages here:
 library(tidyverse)
-library(janitor)
-library(skimr)
-library(randomForest)
-
-# Set seed value of random number generator here:
-set.seed(76)
-
-# Load data 
-training <- read_csv("data/train.csv")
-test <- read_csv("data/test.csv")
-sample_submission <- read_csv("data/sample_submission.csv")
+library(broom)
+library(modelr)
 ```
 
-Note above that `data/train.csv` is once again all the original training data with 1460 rows, unlike PS7 on LASSO where it only had 50 rows to  artificially create a situation where $p$ is very large relative to $n$.
 
 
 
@@ -50,141 +40,54 @@ Note above that `data/train.csv` is once again all the original training data wi
 
 # Preprocessing data
 
-We do some variable cleaning to `training` and `test`. Note how for each step, we apply the changes for both the training and test sets. This is an important principle in machine learning: the training set must be representative of the test set!
+First, prepare the `training` data. Note that `data/train.csv` is the same as in PS7 on LASSO where it only had 50 rows. This is to speed up all computations.
 
+```{r}
+training <- read_csv("data/train.csv") %>% 
+  # Define new outcome variable:
+  mutate(logSalePrice = log(SalePrice+1)) %>% 
+  # Select only needed variables
+  select(logSalePrice, OverallQual, YearBuilt, GrLivArea)
+```
 
-## Clean variable names
+Let's do a quick EDA of the variable `OverallQual`:
 
-Rename variables that start with a number, as such variable names can be problematic in R. 
+```{r}
+ggplot(training, aes(x = OverallQual)) +
+  geom_bar() +
+  labs(x = "Overall quality", title = "Distribution of overall quality")
+```
+
+Let's convert `OverallQual` to a binary categorical variable:
 
 ```{r}
 training <- training %>% 
-  rename(
-    FirstFlrSF = `1stFlrSF`,
-    SecondFlrSF = `2ndFlrSF`,
-    ThirdSsnPorch = `3SsnPorch`
-  )
+  mutate(OverallQual = if_else(OverallQual < 5, "bad", "good"))
 
-test <- test %>% 
-  rename(
-    FirstFlrSF = `1stFlrSF`,
-    SecondFlrSF = `2ndFlrSF`,
-    ThirdSsnPorch = `3SsnPorch`
-  )
+ggplot(training, aes(x = OverallQual)) +
+  geom_bar() +
+  labs(x = "Overall quality", title = "Distribution of overall quality")
 ```
 
 
-## Create new outcome variable
 
-Just like we did in PS3 on CART, we are going to fit our models in log-space for many reasons:
+## Linear regression results
 
-1. To avoid situations where we obtain negative predicted values
-1. To unskew the highly right-skewed original outcome variable `SalePrice`
-1. The Kaggle score is RMSLE and not RMSE. So the following are roughly equivalent
-1. "Fitting models to $y$ = `SalePrice` and using RMSLE as the score"
-1. "Fitting models to $y$ = `logSalePrice` and using RMSE as the score"
+Define model formula:
 
 ```{r}
-training <- training %>% 
-  mutate(logSalePrice = log(SalePrice+1))
-```
-
-Questions to ask yourself or discuss with your peers
-
-1. Why didn't I apply the same change to the `test` set?
-1. If I transformed the outcome variable now, what will I have to make sure to do later on?
-
-
-## Select only numerical predictors
-
-To keep things simple, we're only going to focus on the 36 numerical predictor variables. Given this fact, it's good idea to select only the variables we are going to use. That way when you view them in RStudio's spreadsheet viewer, there is less cognitive load. Think of this as clearing off your desk before you start working.
-
-```{r}
-training <- training %>% 
-  select(
-    # Important non-predictor variables
-    Id, SalePrice, logSalePrice,
-    # All numerical predictor variables
-    MSSubClass, LotFrontage, LotArea, OverallQual, OverallCond, YearBuilt, YearRemodAdd, 
-    MasVnrArea, BsmtFinSF1, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF, FirstFlrSF, SecondFlrSF, 
-    LowQualFinSF, GrLivArea, BsmtFullBath, BsmtHalfBath, FullBath, HalfBath, BedroomAbvGr,
-    KitchenAbvGr, TotRmsAbvGrd, Fireplaces, GarageYrBlt, GarageCars, GarageArea, WoodDeckSF, 
-    OpenPorchSF, EnclosedPorch, ThirdSsnPorch, ScreenPorch, PoolArea, MiscVal, MoSold, YrSold
-  )
-
-test <- test %>% 
-  select(
-    # Important non-predictor variables
-    Id,
-    # All numerical predictor variables
-    MSSubClass, LotFrontage, LotArea, OverallQual, OverallCond, YearBuilt, YearRemodAdd, 
-    MasVnrArea, BsmtFinSF1, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF, FirstFlrSF, SecondFlrSF, 
-    LowQualFinSF, GrLivArea, BsmtFullBath, BsmtHalfBath, FullBath, HalfBath, BedroomAbvGr,
-    KitchenAbvGr, TotRmsAbvGrd, Fireplaces, GarageYrBlt, GarageCars, GarageArea, WoodDeckSF, 
-    OpenPorchSF, EnclosedPorch, ThirdSsnPorch, ScreenPorch, PoolArea, MiscVal, MoSold, YrSold
-  )
-```
-
-
-## Deal with missing values
-
-Many of these numerical predictors have missing values.
-
-```{r, eval=FALSE}
-skim(training)
-skim(test)
-```
-
-An MVP approach to dealing with them is to replace them with the mean of the non-missing values". Note: I know there must be a better way to do this, in particular using the `purrr::map()` function, but done is better than perfect.
-
-```{r}
-training <- training %>% 
-  mutate(
-    LotFrontage = ifelse(is.na(LotFrontage), mean(LotFrontage, na.rm = TRUE), LotFrontage),
-    MasVnrArea = ifelse(is.na(MasVnrArea), mean(MasVnrArea, na.rm = TRUE), MasVnrArea),
-    GarageYrBlt = ifelse(is.na(GarageYrBlt), mean(GarageYrBlt, na.rm = TRUE), GarageYrBlt)
-  )
-test <- test %>% 
-  mutate(
-    LotFrontage = ifelse(is.na(LotFrontage), mean(LotFrontage, na.rm = TRUE), LotFrontage),
-    MasVnrArea = ifelse(is.na(MasVnrArea), mean(MasVnrArea, na.rm = TRUE), MasVnrArea),
-    BsmtFinSF1 = ifelse(is.na(BsmtFinSF1), mean(BsmtFinSF1, na.rm = TRUE), BsmtFinSF1),
-    BsmtFinSF2 = ifelse(is.na(BsmtFinSF2), mean(BsmtFinSF2, na.rm = TRUE), BsmtFinSF2),
-    BsmtUnfSF = ifelse(is.na(BsmtUnfSF), mean(BsmtUnfSF, na.rm = TRUE), BsmtUnfSF),
-    TotalBsmtSF = ifelse(is.na(TotalBsmtSF), mean(TotalBsmtSF, na.rm = TRUE), TotalBsmtSF),
-    BsmtFullBath = ifelse(is.na(BsmtFullBath), mean(BsmtFullBath, na.rm = TRUE), BsmtFullBath),
-    BsmtHalfBath = ifelse(is.na(BsmtHalfBath), mean(BsmtHalfBath, na.rm = TRUE), BsmtHalfBath),
-    GarageYrBlt = ifelse(is.na(GarageYrBlt), mean(GarageYrBlt, na.rm = TRUE), GarageYrBlt),    
-    GarageCars = ifelse(is.na(GarageCars), mean(GarageCars, na.rm = TRUE), GarageCars),
-    GarageArea = ifelse(is.na(GarageArea), mean(GarageArea, na.rm = TRUE), GarageArea)
-  )
-```
-
-
-## Define model formula
-
-We use the same model formula as the `model_formula_full` from PS7. In other words, we are using the same $p$ = 36 numerical predictors.
-
-```{r}
-model_formula <- "logSalePrice ~ MSSubClass + LotFrontage + LotArea + 
-OverallQual + OverallCond + YearBuilt + YearRemodAdd + MasVnrArea + BsmtFinSF1 + 
-BsmtFinSF2 + BsmtUnfSF + TotalBsmtSF + FirstFlrSF + SecondFlrSF + LowQualFinSF + 
-GrLivArea + BsmtFullBath + BsmtHalfBath + FullBath + HalfBath + BedroomAbvGr + 
-KitchenAbvGr + TotRmsAbvGrd + Fireplaces + GarageYrBlt + GarageCars + GarageArea + 
-WoodDeckSF + OpenPorchSF + EnclosedPorch + ThirdSsnPorch + ScreenPorch + PoolArea + 
-MiscVal + MoSold + YrSold" %>% 
+model_formula <- "logSalePrice ~ OverallQual + YearBuilt + GrLivArea" %>% 
   as.formula()
 ```
 
+Output regression table:
 
+```{r}
+model_lm <- lm(model_formula, data = training)
+tidy(model_lm, conf.int = TRUE)
+```
 
-***
-
-
-
-# Fit a Random Forest model
-
-Fit one Random Forest model `model_rf` using any approach you want.
+Your goal is to compute the values in the `estimate` column using the matrix algebra from Lec 28 `regression_linear_algebra.Rmd`. In other words, output a 4 x 1 vector of the values in the second column of the above regression table. Note: in order to perform matrix multiplications, you need to convert all "tibble" data frames to matrix objects using `as.matrix()` first.
 
 ```{r}
 
@@ -192,18 +95,4 @@ Fit one Random Forest model `model_rf` using any approach you want.
 
 
 
-***
-
-
-
-# Make predictions and submit to Kaggle
-
-Using `model_rf` make predictions and submit to Kaggle.
-
-```{r}
-
-```
-
-
-![](images/score_screenshot_naive.png){ width=100% }
 
